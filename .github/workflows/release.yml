@@ -25,64 +25,326 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-            platform: darwin-arm64
-            ext: ""
-            archive: tar.gz
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            platform: darwin-amd64
-            ext: ""
-            archive: tar.gz
-          - os: ubuntu-latest
+          # macOS entries kept as comments for reference (not active)
+          # - os: macos-14
+          #   target: aarch64-apple-darwin
+          #   platform: darwin-arm64
+          #   ext: ""
+          #   archive: tar.gz
+          # - os: macos-15-intel
+          #   target: x86_64-apple-darwin
+          #   platform: darwin-amd64
+          #   ext: ""
+          #   archive: tar.gz
+
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             platform: linux-amd64
             ext: ""
             archive: tar.gz
-          - os: ubuntu-24.04-arm
+
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             platform: linux-arm64
             ext: ""
             archive: tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            platform: windows-amd64
-            ext: .exe
-            archive: zip
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            platform: windows-arm64
-            ext: .exe
-            archive: zip
+
+          # Add linux armv7 as a cross-compile target on ubuntu-latest runner
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            platform: linux-armv7
+            ext: ""
+            archive: tar.gz
+
+          # Windows entries commented out (kept for reference)
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   platform: windows-amd64
+          #   ext: .exe
+          #   archive: zip
+          # - os: windows-11-arm
+          #   target: aarch64-pc-windows-msvc
+          #   platform: windows-arm64
+          #   ext: .exe
+          #   archive: zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
       - name: Build
+        shell: bash
         run: |
-          cargo build --release --locked --target ${{ matrix.target }}
+          set -euo pipefail
+
+          if [ "${{ matrix.target }}" = "armv7-unknown-linux-gnueabihf" ]; then
+            cargo install cargo-zigbuild
+            python3 -m pip install ziglang
+            sudo apt-get update
+            sudo apt-get install -y binutils-arm-linux-gnueabihf
+
+            TARGET="armv7-unknown-linux-gnueabihf"
+            RELEASE_DIR="target/${TARGET}/release"
+            BIN="${RELEASE_DIR}/${BIN_NAME}"
+
+            mkdir -p artifacts
+
+            echo "========== Build original ELF =========="
+            cargo zigbuild --release --locked --target "${TARGET}.2.24"
+
+            test -f "$BIN"
+
+            # Preserve the original, unmodified ELF for comparison.
+            cp "$BIN" artifacts/claude-code-proxy-stage
+
+            echo "========== Original ARM attributes =========="
+            readelf -A artifacts/claude-code-proxy-stage || true
+
+            echo "========== Prepare .ARM.attributes =========="
+            if readelf -A "$BIN" | grep -Fq 'Tag_ABI_VFP_args: VFP registers'; then
+              echo "Required hard-float ABI attribute already exists"
+            else
+              arm-linux-gnueabihf-objcopy --dump-section .ARM.attributes=/tmp/arm.attributes "$BIN"
+
+              python3 - /tmp/arm.attributes <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          data = bytearray(path.read_bytes())
+
+          if not data or data[0] != ord("A"):
+              raise SystemExit("Invalid ARM attributes section")
+
+          def read_uleb(buf, pos):
+              value = 0
+              shift = 0
+              while pos < len(buf):
+                  byte = buf[pos]
+                  pos += 1
+                  value |= (byte & 0x7f) << shift
+                  if byte < 0x80:
+                      return value, pos
+                  shift += 7
+              raise ValueError("Invalid ULEB128")
+
+          pos = 1
+          patched = False
+
+          while pos + 4 <= len(data):
+              vendor_len = struct.unpack_from("<I", data, pos)[0]
+              vendor_end = pos + vendor_len
+
+              if vendor_len < 5 or vendor_end > len(data):
+                  raise SystemExit("Malformed vendor subsection")
+
+              name_start = pos + 4
+              name_end = data.find(b"\0", name_start, vendor_end)
+
+              if name_end < 0:
+                  raise SystemExit("Missing vendor name terminator")
+
+              if data[name_start:name_end] == b"aeabi":
+                  subpos = name_end + 1
+
+                  while subpos < vendor_end:
+                      tag, after_tag = read_uleb(data, subpos)
+
+                      if after_tag + 4 > vendor_end:
+                          raise SystemExit("Malformed attribute subsection")
+
+                      sub_len = struct.unpack_from("<I", data, after_tag)[0]
+                      sub_end = subpos + sub_len
+
+                      if sub_len < after_tag - subpos + 4 or sub_end > vendor_end:
+                          raise SystemExit("Invalid attribute subsection length")
+
+                      if tag == 1:
+                          addition = b"\x1c\x01"
+                          data[sub_end:sub_end] = addition
+                          struct.pack_into("<I", data, after_tag, sub_len + len(addition))
+                          struct.pack_into("<I", data, pos, vendor_len + len(addition))
+                          path.write_bytes(data)
+                          patched = True
+                          break
+
+                      subpos = sub_end
+
+                  break
+
+              pos = vendor_end
+
+          if not patched:
+              raise SystemExit("Could not find aeabi Tag_File subsection")
+
+          print("Added Tag_ABI_VFP_args = VFP registers")
+          PY
+
+              arm-linux-gnueabihf-objcopy --update-section .ARM.attributes=/tmp/arm.attributes "$BIN"
+            fi
+
+            echo "========== Verify final release ELF =========="
+            if ! readelf -A "$BIN" | grep -F 'Tag_ABI_VFP_args: VFP registers'; then
+              echo "::error::Missing Tag_ABI_VFP_args: VFP registers"
+              exit 1
+            fi
+
+            echo "========== GLIBC symbol versions =========="
+            readelf --version-info "$BIN" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu || true
+
+            echo "========== Compare stage vs release ELF =========="
+
+            python3 - "artifacts/claude-code-proxy-stage" "$BIN" <<'PY'
+          import hashlib
+          import difflib
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          stage_path = Path(sys.argv[1])
+          release_path = Path(sys.argv[2])
+
+          stage = stage_path.read_bytes()
+          release = release_path.read_bytes()
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+          print("\n=== File summary ===")
+          print(f"Stage:   {stage_path}")
+          print(f"Release: {release_path}")
+          print(f"Stage size:   {len(stage)} bytes")
+          print(f"Release size: {len(release)} bytes")
+          print(f"Size delta:   {len(release) - len(stage):+d} bytes")
+          print(f"Stage SHA256:   {sha256(stage)}")
+          print(f"Release SHA256: {sha256(release)}")
+
+          print("\n=== readelf -A attribute diff ===")
+          stage_attrs = subprocess.run(
+              ["readelf", "-A", str(stage_path)],
+              capture_output=True, text=True, check=False
+          ).stdout.splitlines()
+
+          release_attrs = subprocess.run(
+              ["readelf", "-A", str(release_path)],
+              capture_output=True, text=True, check=False
+          ).stdout.splitlines()
+
+          attr_diff = list(difflib.unified_diff(
+              stage_attrs,
+              release_attrs,
+              fromfile="stage readelf -A",
+              tofile="release readelf -A",
+              lineterm=""
+          ))
+
+          if attr_diff:
+              print("\n".join(attr_diff))
+          else:
+              print("No textual ARM attribute differences found.")
+
+          print("\n=== Binary byte-level diff ===")
+          common = min(len(stage), len(release))
+          different_bytes = sum(
+              a != b for a, b in zip(stage[:common], release[:common])
+          )
+
+          print(f"Different bytes in common range: {different_bytes}")
+          print(f"Common range length: {common} bytes")
+
+          ranges = []
+          pos = 0
+
+          while pos < common:
+              if stage[pos] == release[pos]:
+                  pos += 1
+                  continue
+
+              start = pos
+              while pos < common and stage[pos] != release[pos]:
+                  pos += 1
+
+              ranges.append((start, pos))
+
+          if len(stage) != len(release):
+              ranges.append((common, max(len(stage), len(release))))
+
+          if not ranges:
+              print("The files are byte-for-byte identical.")
+          else:
+              print(f"Different byte ranges: {len(ranges)}")
+
+              max_ranges = 40
+              for index, (start, end) in enumerate(ranges[:max_ranges], 1):
+                  old = stage[start:min(end, len(stage))]
+                  new = release[start:min(end, len(release))]
+
+                  print(
+                      f"\nRange {index}: [0x{start:x}, 0x{end:x}) "
+                      f"({end - start} bytes)"
+                  )
+                  print(f"  Stage bytes:   {old[:32].hex(' ')}")
+                  print(f"  Release bytes: {new[:32].hex(' ')}")
+
+                  if len(old) > 32:
+                      print(f"  Stage preview truncated; total {len(old)} bytes")
+                  if len(new) > 32:
+                      print(f"  Release preview truncated; total {len(new)} bytes")
+
+              if len(ranges) > max_ranges:
+                  print(
+                      f"\nOutput limited to {max_ranges} ranges; "
+                      f"{len(ranges) - max_ranges} additional ranges omitted."
+                  )
+
+          print("\n=== Comparison complete; no diff files created ===")
+          PY
+
+            echo "========== SHA256 =========="
+            sha256sum artifacts/claude-code-proxy-stage "$BIN"
+
+          else
+            cargo build --release --locked --target "${{ matrix.target }}"
+          fi
+
+      - name: Upload ARMv7 stage ELF
+        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
+        uses: actions/upload-artifact@v5
+        with:
+          name: armv7-stage
+          if-no-files-found: error
+          path: |
+            artifacts/claude-code-proxy-stage
+
+      # Only verify binaries that can be executed on the runner:
+      # - x86_64 build on ubuntu-22.04 (can run here)
+      # - aarch64 build on native aarch64 runner (ubuntu-22.04-arm)
+      # Skip verification for armv7 which is cross-built on x86 runner.
       - name: Verify Unix binary
-        if: runner.os != 'Windows'
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' || matrix.os == 'ubuntu-22.04-arm' }}
         env:
           VERSION: ${{ github.ref_name }}
         run: |
-          expected="claude-code-proxy ${VERSION#v}"
+          expected="${BIN_NAME} ${VERSION#v}"
           actual="$(target/${{ matrix.target }}/release/${BIN_NAME} --version)"
           test "$actual" = "$expected"
-      - name: Verify Windows binary
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          VERSION: ${{ github.ref_name }}
-        run: |
-          $expected = "claude-code-proxy $($env:VERSION.TrimStart('v'))"
-          $actual = & "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" --version
-          if ($actual -ne $expected) {
-            Write-Error "expected '$expected', got '$actual'"
-          }
+
+      # Windows verification/packaging steps are commented out for now
+      # - name: Verify Windows binary
+      #   if: runner.os == 'Windows'
+      #   shell: pwsh
+      #   env:
+      #     VERSION: ${{ github.ref_name }}
+      #   run: |
+      #     $expected = "claude-code-proxy $($env:VERSION.TrimStart('v'))"
+      #     $actual = & "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" --version
+      #     if ($actual -ne $expected) {
+      #       Write-Error "expected '$expected', got '$actual'"
+      #     }
+
       - name: Package Unix
         if: runner.os != 'Windows'
         run: |
@@ -91,16 +353,19 @@ jobs:
           archive="${BIN_NAME}-${{ matrix.platform }}.${{ matrix.archive }}"
           tar -C dist -czf "$archive" "${BIN_NAME}"
           shasum -a 256 "$archive" > "${BIN_NAME}-${{ matrix.platform }}.sha256"
-      - name: Package Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "dist/${env:BIN_NAME}.exe"
-          $archive = "${env:BIN_NAME}-${{ matrix.platform }}.${{ matrix.archive }}"
-          Compress-Archive -Path "dist/${env:BIN_NAME}.exe" -DestinationPath $archive -Force
-          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
-          "$hash  $archive" | Out-File -FilePath "${env:BIN_NAME}-${{ matrix.platform }}.sha256" -Encoding ascii
+
+      # Windows packaging commented out
+      # - name: Package Windows
+      #   if: runner.os == 'Windows'
+      #   shell: pwsh
+      #   run: |
+      #     New-Item -ItemType Directory -Force dist | Out-Null
+      #     Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "dist/${env:BIN_NAME}.exe"
+      #     $archive = "${env:BIN_NAME}-${{ matrix.platform }}.${{ matrix.archive }}"
+      #     Compress-Archive -Path "dist/${env:BIN_NAME}.exe" -DestinationPath $archive -Force
+      #     $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+      #     "$hash  $archive" | Out-File -FilePath "${env:BIN_NAME}-${{ matrix.platform }}.sha256" -Encoding ascii
+
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.platform }}
@@ -108,20 +373,21 @@ jobs:
             ${{ env.BIN_NAME }}-${{ matrix.platform }}.${{ matrix.archive }}
             ${{ env.BIN_NAME }}-${{ matrix.platform }}.sha256
 
-  smoke-windows:
-    needs: build
-    runs-on: windows-latest
-    steps:
-      - uses: actions/download-artifact@v5
-        with:
-          name: windows-amd64
-      - shell: pwsh
-        run: |
-          Expand-Archive claude-code-proxy-windows-amd64.zip -DestinationPath .
-          .\claude-code-proxy.exe --version
+  # Smoke Windows job commented out (kept for reference)
+  # smoke-windows:
+  #   needs: build
+  #   runs-on: windows-latest
+  #   steps:
+  #     - uses: actions/download-artifact@v5
+  #       with:
+  #         name: windows-amd64
+  #     - shell: pwsh
+  #       run: |
+  #         Expand-Archive claude-code-proxy-windows-amd64.zip -DestinationPath .
+  #         .\claude-code-proxy.exe --version
 
   release:
-    needs: [build, smoke-windows]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -131,88 +397,88 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          token: ${{ secrets.RELEASE_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           generate_release_notes: true
           files: |
             *.tar.gz
-            *.zip
             *.sha256
 
-  update-tap:
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v5
-        with:
-          merge-multiple: true
-      - uses: actions/checkout@v5
-        with:
-          repository: raine/homebrew-claude-code-proxy
-          token: ${{ secrets.RELEASE_TOKEN }}
-          path: tap
-      - name: Generate formula and push to tap
-        env:
-          VERSION: ${{ github.ref_name }}
-        run: |
-          VERSION="${VERSION#v}"
-          SHA_ARM=$(awk '{print $1}' claude-code-proxy-darwin-arm64.sha256)
-          SHA_INTEL=$(awk '{print $1}' claude-code-proxy-darwin-amd64.sha256)
-          SHA_LINUX_AMD=$(awk '{print $1}' claude-code-proxy-linux-amd64.sha256)
-          SHA_LINUX_ARM=$(awk '{print $1}' claude-code-proxy-linux-arm64.sha256)
+  # Homebrew tap update removed / commented out per request (kept for reference)
+  # update-tap:
+  # needs: release
+  # runs-on: ubuntu-latest
+  # steps:
+  #   - uses: actions/download-artifact@v5
+  #     with:
+  #       merge-multiple: true
+  #   - uses: actions/checkout@v5
+  #     with:
+  #       repository: raine/homebrew-claude-code-proxy
+  #       token: ${{ secrets.RELEASE_TOKEN }}
+  #       path: tap
+  #   - name: Generate formula and push to tap
+  #     env:
+  #       VERSION: ${{ github.ref_name }}
+  #     run: |
+  #       VERSION="${VERSION#v}"
+  #       SHA_ARM=$(awk '{print $1}' claude-code-proxy-darwin-arm64.sha256)
+  #       SHA_INTEL=$(awk '{print $1}' claude-code-proxy-darwin-amd64.sha256)
+  #       SHA_LINUX_AMD=$(awk '{print $1}' claude-code-proxy-linux-amd64.sha256)
+  #       SHA_LINUX_ARM=$(awk '{print $1}' claude-code-proxy-linux-arm64.sha256)
 
-          mkdir -p tap/Formula
-          cat > tap/Formula/claude-code-proxy.rb << EOF
-          class ClaudeCodeProxy < Formula
-            desc "Local proxy: Claude Code to ChatGPT subscription via Codex Responses API"
-            homepage "https://github.com/raine/claude-code-proxy"
-            version "${VERSION}"
-            license "MIT"
+  #       mkdir -p tap/Formula
+  #       cat > tap/Formula/claude-code-proxy.rb << EOF
+  #       class ClaudeCodeProxy < Formula
+  #         desc "Local proxy: Claude Code to ChatGPT subscription via Codex Responses API"
+  #         homepage "https://github.com/raine/claude-code-proxy"
+  #         version "${VERSION}"
+  #         license "MIT"
 
-            on_macos do
-              if Hardware::CPU.arm?
-                url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-darwin-arm64.tar.gz"
-                sha256 "${SHA_ARM}"
-              else
-                url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-darwin-amd64.tar.gz"
-                sha256 "${SHA_INTEL}"
-              end
-            end
+  #         on_macos do
+  #           if Hardware::CPU.arm?
+  #             url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-darwin-arm64.tar.gz"
+  #             sha256 "${SHA_ARM}"
+  #           else
+  #             url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-darwin-amd64.tar.gz"
+  #             sha256 "${SHA_INTEL}"
+  #           end
+  #         end
 
-            on_linux do
-              if Hardware::CPU.arm?
-                url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-linux-arm64.tar.gz"
-                sha256 "${SHA_LINUX_ARM}"
-              else
-                url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-linux-amd64.tar.gz"
-                sha256 "${SHA_LINUX_AMD}"
-              end
-            end
+  #         on_linux do
+  #           if Hardware::CPU.arm?
+  #             url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-linux-arm64.tar.gz"
+  #             sha256 "${SHA_LINUX_ARM}"
+  #           else
+  #             url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-linux-amd64.tar.gz"
+  #             sha256 "${SHA_LINUX_AMD}"
+  #           end
+  #         end
 
-            def install
-              bin.install "claude-code-proxy"
-            end
+  #         def install
+  #           bin.install "claude-code-proxy"
+  #         end
 
-            service do
-              state_home = ENV.fetch("XDG_STATE_HOME", "#{Dir.home}/.local/state")
+  #         service do
+  #           state_home = ENV.fetch("XDG_STATE_HOME", "#{Dir.home}/.local/state")
 
-              run [opt_bin/"claude-code-proxy", "serve", "--no-monitor"]
-              keep_alive true
-              environment_variables XDG_STATE_HOME: state_home
-              log_path "#{state_home}/claude-code-proxy/service.log"
-              error_log_path "#{state_home}/claude-code-proxy/service.log"
-            end
+  #           run [opt_bin/"claude-code-proxy", "serve", "--no-monitor"]
+  #           keep_alive true
+  #           environment_variables XDG_STATE_HOME: state_home
+  #           log_path "#{state_home}/claude-code-proxy/service.log"
+  #           error_log_path "#{state_home}/claude-code-proxy/service.log"
+  #         end
 
-            test do
-              assert_match version.to_s, shell_output("\#{bin}/claude-code-proxy --version")
-            end
-          end
-          EOF
-          sed -i 's/^          //' tap/Formula/claude-code-proxy.rb
+  #         test do
+  #           assert_match version.to_s, shell_output("\#{bin}/claude-code-proxy --version")
+  #         end
+  #       end
+  #       EOF
+  #       sed -i 's/^          //' tap/Formula/claude-code-proxy.rb
 
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/claude-code-proxy.rb
-          git commit -m "claude-code-proxy ${VERSION}"
-          git pull --rebase
-          git push
+  #       cd tap
+  #       git config user.name "github-actions[bot]"
+  #       git config user.email "github-actions[bot]@users.noreply.github.com"
+  #       git add Formula/claude-code-proxy.rb
+  #       git commit -m "claude-code-proxy ${VERSION}"
+  #       git pull --rebase
+  #       git push
